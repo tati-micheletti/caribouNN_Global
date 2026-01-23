@@ -36,7 +36,7 @@ defineModule(sim, list(
                     "Epochs for the ranking model (keep low for speed)"),
     defineParameter("batchSize", "numeric", 512, 32, 4096, 
                     "Batch size"),
-    defineParameter("learningRate", "numeric", 0.0025, 0.0001, 0.1, 
+    defineParameter("learningRate", "numeric", 0.01, 0.001, 0.1, 
                     paste0("Learning rate. The smaller it is, the longer it takes, but the more",
                            " precise to find the best parameters.")),
     defineParameter("device", "character", "cpu", NA, NA, 
@@ -76,7 +76,7 @@ doEvent.caribouNN_Global = function(sim, eventTime, eventType) {
       
       sim$globalModel <- trainingNN(preparedData = sim$preparedData, 
                                     batchSize = P(sim)$batchSize,
-                                    epoch = P(sim)$epoch
+                                    epoch = P(sim)$epoch,
                                     learningRate =  P(sim)$learningRate)
       
     },
@@ -97,6 +97,16 @@ doEvent.caribouNN_Global = function(sim, eventTime, eventType) {
   message(currentModule(sim), ": using dataPath '", dPath, "'.")
   if (!suppliedElsewhere("extractedVariables", sim = sim)){
     stop("No defaults have been implemented yet...")
+    
+    # Require::Require("osfr")
+    # osf_auth("")
+    # my_file <- osf_retrieve_file("6970e858f56e9335cc0729b2")
+    # pathToStore <- file.path("C:/Users/Tati/GitHub/TestNN", my_file$name)
+    # if (!file.exists(pathToStore)){
+    #   osf_download(x = my_file, path = pathToStore)
+    # }
+    # sim$extractedVariables <- data.table::fread(pathToStore)
+    
   }
   return(invisible(sim))
 }

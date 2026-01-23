@@ -1,51 +1,64 @@
 featureImportance <- function(globalModel, preparedData, batchSize){
   
-  globalTensorX <- preparedData$globalTensorX
-  globalTensorID <- preparedData$globalTensorID
-  featureCandidates <- preparedData$featureCandidates
-  
-  # 4. Permutation Importance
   message("Global Model: Calculating Feature Importance...")
-  model <- globalModel$model
+  
+  # Unpack
+  x <- preparedData$globalTensorX
+  id <- preparedData$globalTensorID
+  candidates <- preparedData$featureCandidates
+  
+  # Extract the raw torch model from the Luz object
+  model <- globalModel$model 
   model$eval()
   
-  # Get Baseline
+  # 1. DEFINE DATASET LOCALLY
+  # We need this definition to create loaders for both Baseline and Permutations
+  ds <- dataset("ds", 
+                initialize = function(x, id) {self$x<-x; self$id<-id},
+                .getitem = function(i) { 
+                  list(list(x=self$x[i,,], id=self$id[i]), torch_tensor(1, dtype=torch_long())) 
+                },
+                .length = function() { self$x$size(1) }
+  )
+  
+  # 2. CALCULATE BASELINE
+  # Create a fresh loader for the original data
+  dl <- dataloader(ds(x, id), batch_size = batchSize, shuffle = FALSE)
+  
   base_loss <- 0
   count <- 0
-  # Use same DL for convenience (technically should be validation, but for RANKING it's okay)
+  
   with_no_grad({
     coro::loop(for (b in dl) {
-      scores <- model(b[[1]])$squeeze(3)
-      base_loss <- base_loss + nnf_cross_entropy(scores, b[[2]])$item()
+      scores <- model(b[[1]]) # Model output is [Batch, Steps]
+      # Squeeze target only
+      base_loss <- base_loss + nnf_cross_entropy(scores, b[[2]]$squeeze())$item()
       count <- count + 1
     })
   })
   base_loss <- base_loss / count
+  message("Baseline Loss: ", round(base_loss, 4))
   
-  imp_df <- data.frame(Feature = featureCandidates, Importance = 0)
+  # 3. PERMUTATION LOOP
+  imp_df <- data.frame(Feature = candidates, Importance = 0)
+  original_x <- x$clone()
   
-  # Permute each feature
-  # Note: We perform permutation on the CPU tensor to save GPU memory if needed
-  # Or directly on the tensor if it fits.
-  
-  original_x <- globalTensorX$clone()
-  
-  for(i in seq_along(featureCandidates)) {
+  for(i in seq_along(candidates)) {
     # Shuffle column i
     perm_x <- original_x$clone()
     idx <- torch::torch_randperm(perm_x$size(1)) + 1L
     perm_x[,,i] <- perm_x[idx,,i]
     
-    # Eval
+    # Create loader for shuffled data using the 'ds' defined above
+    perm_dl <- dataloader(ds(perm_x, id), batch_size = batchSize, shuffle = FALSE)
+    
     new_loss <- 0
     count <- 0
-    perm_ds <- ds(perm_x, globalTensorID)
-    perm_dl <- dataloader(perm_ds, batch_size = batchSize)
     
     with_no_grad({
       coro::loop(for (b in perm_dl) {
-        scores <- model(b[[1]])$squeeze(3)
-        new_loss <- new_loss + nnf_cross_entropy(scores, b[[2]])$item()
+        scores <- model(b[[1]])
+        new_loss <- new_loss + nnf_cross_entropy(scores, b[[2]]$squeeze())$item()
         count <- count + 1
       })
     })
@@ -55,11 +68,10 @@ featureImportance <- function(globalModel, preparedData, batchSize){
     cat(".")
   }
   
-  # 5. Set Output
+  # 4. Return Sorted List
   imp_df <- imp_df[order(-imp_df$Importance),]
   print(head(imp_df, 10))
   
-  featurePriority <- imp_df$Feature
   message("\nGlobal Feature Ranking Complete.")
-  return(featurePriority)
+  return(imp_df)
 }
