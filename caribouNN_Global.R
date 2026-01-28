@@ -52,7 +52,9 @@ defineModule(sim, list(
     createsOutput("preparedData", "list", 
                   "List containing information for running the model"),
     createsOutput("globalModel", "luz_module_fitted", 
-                  "The trained global model")
+                  "The trained global model"),
+    createsOutput("preparedDataFinal", "data.table", 
+                  "Dataset of raw features after preparation (interactions added, etc.)")
   )
 ))
 
@@ -67,24 +69,36 @@ doEvent.caribouNN_Global = function(sim, eventTime, eventType) {
       sim <- scheduleEvent(sim, time(sim), "caribouNN_Global", "prepareData")
       sim <- scheduleEvent(sim, time(sim), "caribouNN_Global", "trainTheModel")
       sim <- scheduleEvent(sim, time(sim), "caribouNN_Global", "rankFeatures")
+      sim <- scheduleEvent(sim, time(sim), "caribouNN_Global", "calculateRSS")
     },
     prepareData = {
-
+      
+      # TODO If the data is prepared and nobody wants to redo it, just use it!
        sim$preparedData <- prepareNNdata(extractedVariables = sim$extractedVariables)
+       sim$preparedDataFinal <- sim$preparedData$preparedDataFinal
+       fwrite(sim$preparedDataFinal, file = file.path(outputPath(sim), 
+                                                      "preparedModelInputs.csv"))
     },
     trainTheModel = {
-      
-      sim$globalModel <- trainingNN(preparedData = sim$preparedData, 
+      # TODO If the model has been fit and is saved and there is no reason to redo it,
+      # just load it.
+      sim$globalModel <- trainingNN(preparedData = sim$preparedData$modelPrep, 
                                     batchSize = P(sim)$batchSize,
                                     epoch = P(sim)$epoch,
-                                    learningRate =  P(sim)$learningRate)
-      
+                                    learningRate =  P(sim)$learningRate,
+                                    outputDir = outputPath(sim))
     },
       rankFeatures = {
         
         sim$featurePriority <- featureImportance(globalModel = sim$globalModel, 
                                                  preparedData = sim$preparedData, 
                                                  batchSize = P(sim)$batchSize)
+    },
+    calculateRSS = {
+      
+      sim$RSS <- generateRSS(preparedDataFinal = sim$preparedDataFinal, 
+                                               globalModel = sim$globalModel,
+                                               preparedData = sim$preparedData$modelPrep)
     },
     warning(noEventWarning(sim))
   )
