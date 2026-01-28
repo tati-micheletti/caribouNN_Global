@@ -1,4 +1,4 @@
-trainingNN <- function(preparedData, batchSize, learningRate, epochs, validationSplit = 0.2){
+trainingNN <- function(preparedData, batchSize, learningRate, epochs, validationSplit = 0.2, outputDir){
   
   globalTensorX <- preparedData$globalTensorX
   globalTensorID <- preparedData$globalTensorID
@@ -19,7 +19,7 @@ trainingNN <- function(preparedData, batchSize, learningRate, epochs, validation
                 .length = function() { self$x$size(1) }
   )
   
-  # 2. Split Data (Train vs Validation)
+  # 2. Split Data
   n_samples <- globalTensorX$size(1) 
   all_indices <- 1:n_samples
   
@@ -28,7 +28,6 @@ trainingNN <- function(preparedData, batchSize, learningRate, epochs, validation
   
   train_x <- globalTensorX[train_indices, , ]
   train_id <- globalTensorID[train_indices]
-  
   val_x <- globalTensorX[val_indices, , ]
   val_id <- globalTensorID[val_indices]
   
@@ -60,9 +59,13 @@ trainingNN <- function(preparedData, batchSize, learningRate, epochs, validation
     nnf_cross_entropy(input, target$squeeze())
   }
   
-  # 5. Fit
-  tmp_path <- file.path(tempdir(), "global_best_model.pt")
+  # 5. Define Paths
+  # checkpointPath: Saves only the weights (smaller file, used for reloading)
+  checkpointPath <- file.path(outputDir, "global_best_weights.pt")
+  # finalModelPath: Saves the whole Luz object (safe for future sessions)
+  finalModelPath <- file.path(outputDir, "global_best_model.pt")
   
+  # 6. Fit
   fitted <- Net %>%
     setup(
       loss = loss_wrapper, 
@@ -80,9 +83,8 @@ trainingNN <- function(preparedData, batchSize, learningRate, epochs, validation
       epochs = epochs, 
       valid_data = val_dl,
       callbacks = list(
-        # Save best model to disk
-        luz_callback_model_checkpoint(path = tmp_path, save_best_only = TRUE),
-        # Stop if no improvement
+        # SAVE HERE: This saves the weights every time metrics improve
+        luz_callback_model_checkpoint(path = checkpointPath, save_best_only = TRUE),
         luz_callback_early_stopping(patience = 5),
         luz_callback_lr_scheduler(
           lr_reduce_on_plateau, 
@@ -96,43 +98,39 @@ trainingNN <- function(preparedData, batchSize, learningRate, epochs, validation
   
   message("\nGlobal Model Fitting Complete.")
   
-  # 6. RELOAD BEST WEIGHTS (FIXED)
-  if (file.exists(tmp_path)) {
-    message("Reloading weights from best epoch...")
-    checkpoint <- torch_load(tmp_path)
+  # 7. RELOAD BEST WEIGHTS (Robust)
+  if (file.exists(checkpointPath)) {
+    message("Reloading weights from best epoch: ", checkpointPath)
     
     tryCatch({
-      checkpoint <- torch_load(tmp_path)
+      checkpoint <- torch_load(checkpointPath)
       weights_to_load <- NULL
       
-      # CHECK 1: Standard Luz Key
+      # Determine format of the saved file
       if (is.list(checkpoint) && "model" %in% names(checkpoint)) {
-        message(" -> Detected Luz Bundle (Key: 'model'). Extracting weights.")
         weights_to_load <- checkpoint$model
-        
-        # CHECK 2: Alternative Luz Key
       } else if (is.list(checkpoint) && "model_state_dict" %in% names(checkpoint)) {
-        message(" -> Detected Luz Bundle (Key: 'model_state_dict'). Extracting weights.")
         weights_to_load <- checkpoint$model_state_dict
-        
-        # CHECK 3: Raw Weights
       } else {
-        message(" -> Assuming Raw State Dict.")
         weights_to_load <- checkpoint
       }
       
       fitted$model$load_state_dict(weights_to_load)
-      message(" -> Success! Best model loaded.")
+      message(" -> Success! Best model weights loaded into memory.")
       
     }, error = function(e) {
       message("!!! WARNING: Could not reload best weights. Using Last Epoch. !!!")
       message("Error: ", e$message)
     })
     
-    unlink(tmp_path)
   } else {
     warning("Best model checkpoint not found. Using last epoch weights.")
   }
+  
+  # 8. SAVE FINAL OBJECT (The "External Pointer" Fix)
+  # Now that the object has the best weights loaded, save the whole thing safely.
+  message("Saving final full model object to: ", finalModelPath)
+  luz_save(fitted, finalModelPath)
   
   return(fitted)
 }

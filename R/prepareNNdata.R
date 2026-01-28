@@ -125,8 +125,9 @@ prepareNNdata <- function(extractedVariables){
   valid_ids <- dt[case_ == TRUE, idIndex]
   globalTensorID <- torch::torch_tensor(valid_ids, dtype = torch::torch_long())
   
-  return(list(globalTensorX = globalTensorX,
-              globalTensorID = globalTensorID,
-              globalNAnimals = dtglobalNAnimals,
-              featureCandidates = dtfeatureCandidates))
+  return(list(modelPrep = list(globalTensorX = globalTensorX,
+                               globalTensorID = globalTensorID,
+                               globalNAnimals = dtglobalNAnimals,
+                               featureCandidates = dtfeatureCandidates),
+              preparedDataFinal = dt))
 }
