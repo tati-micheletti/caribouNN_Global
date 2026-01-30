@@ -151,7 +151,7 @@ doEvent.caribouNN_Global = function(sim, eventTime, eventType) {
     # Require::Require("osfr")
     # osf_auth("")
     # my_file <- osf_retrieve_file("6970e858f56e9335cc0729b2")
-    # pathToStore <- file.path("C:/Users/Tati/GitHub/TestNN", my_file$name)
+    # pathToStore <- file.path("~/outputs", my_file$name)
     # if (!file.exists(pathToStore)){
     #   osf_download(x = my_file, path = pathToStore)
     # }
