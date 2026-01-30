@@ -1,4 +1,4 @@
-prepareNNdata <- function(extractedVariables){
+prepareNNdata <- function(extractedVariables, pathX, pathID){
   message("Preparing Data...")
   
   # 1. OPTIMIZATION: Keep only necessary columns immediately
@@ -125,8 +125,14 @@ prepareNNdata <- function(extractedVariables){
   valid_ids <- dt[case_ == TRUE, idIndex]
   globalTensorID <- torch::torch_tensor(valid_ids, dtype = torch::torch_long())
   
-  return(list(modelPrep = list(globalTensorX = globalTensorX,
-                               globalTensorID = globalTensorID,
+  message("Saving processed tensors to disk...")
+  
+  # SAVING
+  torch_save(globalTensorX, pathX)
+  torch_save(globalTensorID, pathID)
+  
+  return(list(modelPrep = list(globalTensorX = pathX,
+                               globalTensorID = pathID,
                                globalNAnimals = dtglobalNAnimals,
                                featureCandidates = dtfeatureCandidates),
               preparedDataFinal = dt))

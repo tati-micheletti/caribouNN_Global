@@ -1,109 +1,74 @@
-calculateRSS <- function(model, dataset_tensor, feature_name, 
-                                 target_values, scaling_stats, 
-                                 feature_list, interaction_pairs = NULL) {
+calculateRSS <- function(fittedModel, datasetTensor, idTensor, featureName, 
+                         targetValues, scalingStats, 
+                         featureList, interactionMap = NULL) {
   
-  # 1. Setup
-  device <- "cpu" # Safer for inference loops
-  model <- model$model # Extract raw torch module
-  model$eval()
-  model$to(device = device)
+  # 1. Setup Device
+  device <- torch_device("cpu")
   
-  # Identify column index for the main feature
-  feat_idx <- which(feature_list == feature_name)
-  if(length(feat_idx) == 0) stop("Feature not found in model inputs")
+  # 2. Extract Model Module Safely
+  if (inherits(fittedModel, "luz_module_fitted")) {
+    ModelObj <- fittedModel$model
+  } else {
+    ModelObj <- fittedModel
+  }
+  ModelObj$eval()
+  ModelObj$to(device = device)
   
-  # Identify column index for the interaction (if any)
-  inter_idx <- NULL
-  if (!is.null(interaction_pairs) && feature_name %in% names(interaction_pairs)) {
-    inter_name <- interaction_pairs[[feature_name]]
-    inter_idx <- which(feature_list == inter_name)
+  # 3. Identify Indices
+  featIdx  <- which(featureList == featureName)
+  logSlIdx <- which(featureList == "logSl")
+  
+  interIdx <- NULL
+  if (!is.null(interactionMap) && featureName %in% names(interactionMap)) {
+    interName <- interactionMap[[featureName]]
+    interIdx  <- which(featureList == interName)
   }
   
-  # Get Scaling info
-  mu <- scaling_stats[[feature_name]]$mean
-  sigma <- scaling_stats[[feature_name]]$sd
+  # 4. Get Scaling Params
+  mu    <- scalingStats[[featureName]]$mean
+  sigma <- scalingStats[[featureName]]$sd
   
-  # We need the 'logSl' index if we are updating an interaction
-  logSl_idx <- which(feature_list == "logSl")
+  # 5. Subset Data
+  nSamples      <- min(500, datasetTensor$size(1))
+  baseTensor    <- datasetTensor$narrow(1, 1, nSamples)$clone()$to(device = device)
+  realIds       <- idTensor$narrow(1, 1, nSamples)$to(device = device)
   
-  # Prepare Results Storage
-  results <- data.frame(Value = target_values, logRSS = NA)
+  # 6. Baseline (Set variable to Mean = 0)
+  # Create index tensor safely to avoid dtype conversion errors
+  idxT <- torch_tensor(as.integer(featIdx))$to(dtype = torch_long(), device = device)
+  baseTensor$index_fill_(3, idxT, 0)
   
-  # Use a subset of data for speed (e.g., 1000 random bursts)
-  # We use the observed data structure to maintain realistic correlations for other vars
-  n_samples <- min(1000, dataset_tensor$size(2))
-  sample_indices <- 1:n_samples
-  
-  # Clone the baseline tensor to modify
-  # Shape: [Steps, Bursts, Features]
-  base_tensor <- dataset_tensor[, sample_indices, , drop=FALSE]$clone()$to(device)
-  
-  # 2. Calculate Baseline Score (at the Mean)
-  # In iSSA, RSS is usually compared to the Mean Availability.
-  # Since we scaled data, Mean = 0.
-  
-  base_tensor[,,feat_idx] <- 0 # Set main effect to Mean (0)
-  if(!is.null(inter_idx)) {
-    # If main var is mean (0), then Interaction (logSl * 0) is also 0
-    base_tensor[,,inter_idx] <- 0 
+  if(!is.null(interIdx)) {
+    idxInterT <- torch_tensor(as.integer(interIdx))$to(dtype = torch_long(), device = device)
+    baseTensor$index_fill_(3, idxInterT, 0)
   }
-  
-  # Get Reference Score (prediction at the mean)
-  # We create a dummy ID tensor (embeddings don't matter for relative difference of environmental vars)
-  dummy_id <- torch_zeros(n_samples, dtype=torch_long())$to(device)
   
   with_no_grad({
-    ref_scores <- model(list(x=base_tensor, id=dummy_id))
-    avg_ref_score <- mean(ref_scores$numpy())
+    refScores    <- ModelObj(list(x = baseTensor, id = realIds))
+    avgRefScore  <- as.numeric(refScores$mean()$cpu())
   })
   
-  # 3. Loop through target values
-  message(paste("Calculating RSS for", feature_name, "..."))
+  # 7. Prediction Loop
+  results <- data.frame(Value = targetValues, logRSS = NA)
   
-  for (i in seq_along(target_values)) {
-    val_raw <- target_values[i]
+  for (i in seq_along(targetValues)) {
+    valScaled <- (targetValues[i] - mu) / sigma
     
-    # Scale the value
-    val_scaled <- (val_raw - mu) / sigma
+    workTensor <- baseTensor$clone()
+    workTensor$index_fill_(3, idxT, valScaled)
     
-    # Update Tensor
-    work_tensor <- base_tensor$clone()
-    
-    # A. Set Main Effect
-    work_tensor[,,feat_idx] <- val_scaled
-    
-    # B. Set Interaction
-    if (!is.null(inter_idx)) {
-      # Recalculate interaction: logSl * new_value
-      # Note: logSl is already scaled in the tensor, which makes this tricky.
-      # Ideally, interaction = logSl_scaled * val_scaled is what the NN saw during training
-      # if one calculated interaction AFTER scaling logSl.
-      
-      # Check your prepareNNdata: 
-      # You did: set(dt, j=newCol, value = vec_logSl * dt[[var]]) THEN scaled.
-      # This means we need to replicate that logic exactly? 
-      # Actually, since the NN learned on SCALED inputs, we just inject 
-      # the new scaled value.
-      
-      # Simpler approach: The NN treats "inter_logSl_x_dist" as just another column.
-      # But logically, if Dist changes, Inter changes.
-      # Approximation: Update interaction column based on the relationship correlation?
-      # BETTER: If you used 'logSl' in the model, grab it:
-      current_logSl <- work_tensor[,,logSl_idx]
-      
-      # Update interaction: current_logSl * val_scaled
-      # (Assuming logSl and Dist were roughly independent before interaction)
-      work_tensor[,,inter_idx] <- current_logSl * val_scaled
+    if (!is.null(interIdx)) {
+      currentLogSl <- workTensor$select(3, logSlIdx)
+      newInterVals <- currentLogSl * valScaled
+      workTensor$narrow(3, interIdx, 1)$copy_(newInterVals$unsqueeze(3))
     }
     
-    # Predict
     with_no_grad({
-      scores <- model(list(x=work_tensor, id=dummy_id))
-      avg_score <- mean(scores$numpy())
+      scores   <- ModelObj(list(x = workTensor, id = realIds))
+      avgScore <- as.numeric(scores$mean()$cpu())
     })
     
-    # RSS = Score(x) - Score(ref)
-    results$logRSS[i] <- avg_score - avg_ref_score
+    results$logRSS[i] <- avgScore - avgRefScore
   }
   
   return(results)

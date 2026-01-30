@@ -1,13 +1,15 @@
-featureImportance <- function(globalModel, preparedData, batchSize){
+featureImportance <- function(globalModelPath, preparedData, batchSize){
   
   message("Global Model: Calculating Feature Importance...")
   
   # Unpack
-  x <- preparedData$globalTensorX
-  id <- preparedData$globalTensorID
-  candidates <- preparedData$featureCandidates
-  
+  # 1. LOAD TENSORS
+  x <- torch_load(preparedData$modelPrep$globalTensorX)
+  id <- torch_load(preparedData$modelPrep$globalTensorID)
+  candidates <- preparedData$modelPrep$featureCandidates
+
   # Extract the raw torch model from the Luz object
+  globalModel <- luz_load(globalModelPath)
   model <- globalModel$model 
   model$eval()
   
@@ -43,10 +45,14 @@ featureImportance <- function(globalModel, preparedData, batchSize){
   imp_df <- data.frame(Feature = candidates, Importance = 0)
   original_x <- x$clone()
   
+  # Get number of bursts once (Integer)
+  n_bursts <- original_x$size(1)
+  
   for(i in seq_along(candidates)) {
     # Shuffle column i
     perm_x <- original_x$clone()
-    idx <- torch::torch_randperm(perm_x$size(1)) + 1L
+    # idx <- torch::torch_randperm(perm_x$size(1)) + 1L
+    idx <- sample.int(n_bursts)
     perm_x[,,i] <- perm_x[idx,,i]
     
     # Create loader for shuffled data using the 'ds' defined above

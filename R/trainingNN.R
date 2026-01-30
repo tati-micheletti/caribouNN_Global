@@ -1,11 +1,14 @@
-trainingNN <- function(preparedData, batchSize, learningRate, epochs, validationSplit = 0.2, outputDir){
+trainingNN <- function(preparedData, batchSize, learningRate, epochs, 
+                       validationSplit = 0.2, outputDir, globalModelPath){
   
-  globalTensorX <- preparedData$globalTensorX
-  globalTensorID <- preparedData$globalTensorID
+  message("Global Model: Loading Tensors from disk...")
+  
+  globalTensorX <- torch_load(preparedData$globalTensorX)
+  globalTensorID <- torch_load(preparedData$globalTensorID)
   globalNAnimals <- preparedData$globalNAnimals
   featureCandidates <- preparedData$featureCandidates
   
-  message("Global Model: Training with Early Stopping & Best Model Saving...")
+  message("Global Model: Training with Early Stopping and Best Model Saving...")
   
   # 1. Dataset
   ds <- dataset("ds", 
@@ -62,8 +65,7 @@ trainingNN <- function(preparedData, batchSize, learningRate, epochs, validation
   # 5. Define Paths
   # checkpointPath: Saves only the weights (smaller file, used for reloading)
   checkpointPath <- file.path(outputDir, "global_best_weights.pt")
-  # finalModelPath: Saves the whole Luz object (safe for future sessions)
-  finalModelPath <- file.path(outputDir, "global_best_model.pt")
+  # globalModelPath: Saves the whole Luz object (safe for future sessions)
   
   # 6. Fit
   fitted <- Net %>%
@@ -129,8 +131,8 @@ trainingNN <- function(preparedData, batchSize, learningRate, epochs, validation
   
   # 8. SAVE FINAL OBJECT (The "External Pointer" Fix)
   # Now that the object has the best weights loaded, save the whole thing safely.
-  message("Saving final full model object to: ", finalModelPath)
-  luz_save(fitted, finalModelPath)
+  message("Saving final full model object to: ", globalModelPath)
+  luz_save(fitted, globalModelPath)
   
-  return(fitted)
+  return(globalModelPath)
 }
