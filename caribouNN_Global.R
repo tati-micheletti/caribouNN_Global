@@ -4,7 +4,7 @@ defineModule(sim, list(
   keywords = c("Neural Network", "Feature Importance", "Luz"),
   authors = structure(list(list(given = "Tati", family = "Micheletti", role = c("aut", "cre"), email = "tati.micheletti@gmail.com", comment = NULL)), class = "person"),
   childModules = character(0),
-  version = list(caribouNN_Global = "0.0.0.1"),
+  version = list(caribouNN_Global = "1.0.0"),
   timeframe = as.POSIXlt(c(NA, NA)),
   timeunit = "year",
   citation = list("citation.bib"),
@@ -24,22 +24,19 @@ defineModule(sim, list(
                     "This describes the simulation time interval between save events."),
     defineParameter(".studyAreaName", "character", NA, NA, NA,
                     "Human-readable name for the study area used - e.g., a hash of the study",
-                          "area obtained using `reproducible::studyAreaName()`"),
+                    "area obtained using `reproducible::studyAreaName()`"),
     ## .seed is optional: `list('init' = 123)` will `set.seed(123)` for the `init` event only.
     defineParameter(".seed", "list", list(), NA, NA,
                     "Named list of seeds to use for each event (names)."),
     defineParameter(".useCache", "logical", FALSE, NA, NA,
                     "Should caching of events or module be used?"),
-    defineParameter("sampleSize", "numeric", 0.20, 0.01, 1.0, "Fraction of data to use for ranking (0.2 = 20%)"),
-    defineParameter("epochs", "numeric", 100, 10, 200, 
+    defineParameter("epoch", "numeric", 100, 10, 200, 
                     "Epochs for the ranking model (keep low for speed)"),
     defineParameter("batchSize", "numeric", 512, 32, 4096, 
                     "Batch size"),
     defineParameter("learningRate", "numeric", 0.01, 0.001, 0.1, 
                     paste0("Learning rate. The smaller it is, the longer it takes, but the more",
                            " precise to find the best parameters.")),
-    defineParameter("device", "character", "cpu", NA, NA, 
-                    "Device (cpu/cuda). With high RAM, cpu is better."),
     defineParameter("rerunPrepData", "logical", FALSE, NA, NA, 
                     "Should the dataPrep be re-run?"),
     defineParameter("rerunTraining", "logical", FALSE, NA, NA, 
@@ -47,7 +44,10 @@ defineModule(sim, list(
     defineParameter("rerunRanking", "logical", FALSE, NA, NA, 
                     "Should the feature ranking be re-run?"),
     defineParameter("rerunRSS", "logical", FALSE, NA, NA, 
-                    "Should the RSS be re-run?")
+                    "Should the RSS be re-run?"),
+    defineParameter("scheduleGlobalRSS", "logical", TRUE, NA, NA, 
+                    "Should the RSS be scheduled to run?")
+    
   ),
   inputObjects = bindrows(
     expectsInput("extractedVariables", "data.table", "Raw feature table")
@@ -72,7 +72,9 @@ doEvent.caribouNN_Global = function(sim, eventTime, eventType) {
       sim <- scheduleEvent(sim, time(sim), "caribouNN_Global", "prepareData")
       sim <- scheduleEvent(sim, time(sim), "caribouNN_Global", "trainTheModel")
       sim <- scheduleEvent(sim, time(sim), "caribouNN_Global", "rankFeatures")
-      sim <- scheduleEvent(sim, time(sim), "caribouNN_Global", "calculateRSS")
+      if (P(sim)$scheduleGlobalRSS){
+        sim <- scheduleEvent(sim, time(sim), "caribouNN_Global", "calculateRSS")
+      }
     },
     prepareData = {
       pathX <- file.path(outputPath(sim), "tensor_x.pt")
@@ -80,26 +82,26 @@ doEvent.caribouNN_Global = function(sim, eventTime, eventType) {
       globalNAnimalsPath <- file.path(outputPath(sim), "globalNAnimals.rds")
       featureCandidatesPath <- file.path(outputPath(sim), "featureCandidates.rds")
       prepDataPath <- file.path(outputPath(sim), "preparedModelInputs.csv")
-       if (all(file.exists(pathX),
-               file.exists(pathID),
-               file.exists(globalNAnimalsPath),
-               file.exists(featureCandidatesPath),
-               file.exists(prepDataPath),
-               !P(sim)$rerunPrepData)){
-         message("All inputs for prepareData found. Loading...")
-         sim$preparedData <- list(modelPrep = list(globalTensorX = pathX,
-                                                   globalTensorID = pathID,
-                                                   globalNAnimals = readRDS(globalNAnimalsPath),
-                                                   featureCandidates = readRDS(featureCandidatesPath)),
-                                  preparedDataFinal = fread(prepDataPath))
-       } else {
-         sim$preparedData <- prepareNNdata(extractedVariables = sim$extractedVariables,
-                                           pathX = pathX,
-                                           pathID = pathID)
-         saveRDS(sim$preparedData$modelPrep$globalNAnimals, file = globalNAnimalsPath)
-         saveRDS(sim$preparedData$modelPrep$featureCandidates, file = featureCandidatesPath)
-         fwrite(sim$preparedData$preparedDataFinal, file = prepDataPath)
-       }
+      if (all(file.exists(pathX),
+              file.exists(pathID),
+              file.exists(globalNAnimalsPath),
+              file.exists(featureCandidatesPath),
+              file.exists(prepDataPath),
+              !P(sim)$rerunPrepData)){
+        message("All inputs for prepareData found. Loading...")
+        sim$preparedData <- list(modelPrep = list(globalTensorX = pathX,
+                                                  globalTensorID = pathID,
+                                                  globalNAnimals = readRDS(globalNAnimalsPath),
+                                                  featureCandidates = readRDS(featureCandidatesPath)),
+                                 preparedDataFinal = fread(prepDataPath))
+      } else {
+        sim$preparedData <- prepareNNdata(extractedVariables = sim$extractedVariables,
+                                          pathX = pathX,
+                                          pathID = pathID)
+        saveRDS(sim$preparedData$modelPrep$globalNAnimals, file = globalNAnimalsPath)
+        saveRDS(sim$preparedData$modelPrep$featureCandidates, file = featureCandidatesPath)
+        fwrite(sim$preparedData$preparedDataFinal, file = prepDataPath)
+      }
     },
     trainTheModel = {
       globalModelPath <- file.path(outputPath(sim), "global_best_model.pt")
@@ -116,21 +118,21 @@ doEvent.caribouNN_Global = function(sim, eventTime, eventType) {
                                       globalModelPath = globalModelPath)
       }
     },
-      rankFeatures = {
-        prepRankPath <- file.path(outputPath(sim), "featureTable.csv")
-        if (all(file.exists(prepRankPath),
-                !P(sim)$rerunRanking)){
-          message("All inputs for rankFeatures found. Loading...")
-          sim$featurePriority <- fread(prepRankPath)
-        } else {
-          sim$featurePriority <- featureImportance(globalModelPath = sim$globalModel, 
-                                                   preparedData = sim$preparedData, 
-                                                   batchSize = P(sim)$batchSize)
-          fwrite(as.data.table(sim$featurePriority), file = prepRankPath)
-          }
+    rankFeatures = {
+      prepRankPath <- file.path(outputPath(sim), "featureTable.csv")
+      if (all(file.exists(prepRankPath),
+              !P(sim)$rerunRanking)){
+        message("All inputs for rankFeatures found. Loading...")
+        sim$featurePriority <- fread(prepRankPath)
+      } else {
+        sim$featurePriority <- featureImportance(globalModelPath = sim$globalModel, 
+                                                 preparedData = sim$preparedData, 
+                                                 batchSize = P(sim)$batchSize)
+        fwrite(as.data.table(sim$featurePriority), file = prepRankPath)
+      }
     },
     calculateRSS = {
-
+      
       sim$RSS <- generateRSS(preparedDataFinal = sim$preparedData$preparedDataFinal,
                              globalModel = sim$globalModel,
                              preparedData = sim$preparedData$modelPrep,

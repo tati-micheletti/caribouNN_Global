@@ -1,51 +1,40 @@
 prepareNNdata <- function(extractedVariables, pathX, pathID){
   message("Preparing Data...")
   
-  # 1. OPTIMIZATION: Keep only necessary columns immediately
-  # (Saves RAM and makes copying faster)
-  cols_needed <- c("sl_", "ta_", "indiv_step_id", "id", "case_", 
-                   names(extractedVariables)[grep("_start|_end", names(extractedVariables))])
-  # Add specific distance columns if regex missed them
-  cols_needed <- unique(c(cols_needed, "distpaved_start", "distunpaved_start", "distpolys_start", 
-                          "timeSinceFire_start", "timeSinceHarvest_start"))
-  cols_needed <- intersect(cols_needed, names(extractedVariables))
+  # 1. Create a full copy so we don't modify the input by reference
+  dt <- copy(extractedVariables)
   
-  dt <- extractedVariables[, ..cols_needed]
-  
-  # 2. Cleaning
+  # 2. Basic Cleaning
+  # We only omit rows missing the essential movement/id data
   dt <- na.omit(dt, cols = c("sl_", "ta_", "indiv_step_id", "id"))
-  dt[, indiv_step_id := as.factor(indiv_step_id)]
-  dt[, id := as.factor(id)]
   
   # ----------------------------------------------------------------------
-  # OPTIMIZATION: FILTER BURSTS *BEFORE* MATH
+  # 3. FILTER VALID STRATA (BURSTS)
   # ----------------------------------------------------------------------
+  originalTotalStrata <- uniqueN(dt$indiv_step_id)
+  message("Validating ", originalTotalStrata, " strata...")
   
-  # 1. Count Total (Before Filtering)
-  originalTotalBursts <- uniqueN(dt$indiv_step_id)
-  message("Filtering valid bursts from ", originalTotalBursts, " total candidates...")
-  
-  # 2. Determine Mode (Target Step Count)
+  # A. Determine Target Step Count (The Mode, usually 11)
   counts <- dt[, .N, by = indiv_step_id]
   steps <- as.numeric(names(sort(table(counts$N), decreasing=TRUE)[1]))
   
-  # 3. Identify Valid Bursts
-  # Valid = (Count == Mode) AND (Sum(case_) == 1)
-  valid_stats <- dt[, .(n = .N, n_case = sum(case_)), by = indiv_step_id]
-  valid_ids <- valid_stats[n == steps & n_case == 1, indiv_step_id]
+  # B. Identify Valid Strata
+  # Rule: Must have correct number of steps AND exactly 1 observed case
+  valid_stats <- dt[, .(n_rows = .N, n_case = sum(case_)), by = indiv_step_id]
+  valid_ids <- valid_stats[n_rows == steps & n_case == 1, indiv_step_id]
   
-  # 4. Apply Filter
+  # C. Apply Filter
   dt <- dt[indiv_step_id %in% valid_ids]
-  setorder(dt, indiv_step_id, -case_) 
+  setorder(dt, indiv_step_id, -case_) # Case (TRUE) is always index 1
   
-  # 5. Print Percentage
-  kept_pct <- round((length(valid_ids) / originalTotalBursts) * 100, 1)
-  message("Kept ", length(valid_ids), " valid bursts (", 
-          kept_pct, "% of ", originalTotalBursts, 
-          "). Starting Feature Engineering...")
+  # D. Reporting
+  kept_pct <- round((length(valid_ids) / originalTotalStrata) * 100, 1)
+  message("Kept ", length(valid_ids), " valid strata (", 
+          kept_pct, "% of ", originalTotalStrata, 
+          "). Proceeding to Engineering...")
   
   # ----------------------------------------------------------------------
-  # FEATURE ENGINEERING
+  # 4. FEATURE ENGINEERING (ADDITIVE)
   # ----------------------------------------------------------------------
   
   # Vegetation Aggregates
@@ -58,7 +47,7 @@ prepareNNdata <- function(extractedVariables, pathX, pathID){
   dt[, prop_mixedforest_start := rowSums(.SD, na.rm = TRUE), .SDcols = intersect(names(dt), c("prop_mixed_start", "prop_deciduous_start"))]
   dt[, prop_mixedforest_end := rowSums(.SD, na.rm = TRUE), .SDcols = intersect(names(dt), c("prop_mixed_end", "prop_deciduous_end"))]
   
-  # Basic Transforms
+  # Transforms
   dt[, logSl := log(sl_ + 1)]
   dt[, cosTa := cos(ta_)]
   dt[, sinTa := sin(ta_)]
@@ -69,29 +58,20 @@ prepareNNdata <- function(extractedVariables, pathX, pathID){
     if(paste0(v, "_end") %in% names(dt))   dt[, (paste0(v, "_endLog")) := log(get(paste0(v, "_end")) + 1)]
   }
   
-  # ----------------------------------------------------------------------
-  # FAST INTERACTIONS (Using set() for Speed)
-  # ----------------------------------------------------------------------
+  # Fast Interactions (Using set())
   interVars <- c("prop_needleleaf_start", "prop_mixedforest_start", "prop_veg_start", "prop_wets_start",
                  "timeSinceFire_startLog", "timeSinceHarvest_startLog",
                  "distpaved_startLog", "distunpaved_startLog", "distpolys_startLog")
   
-  interactionCols <- c()
-  
-  # Pre-calculate logSl vector to avoid repetitive lookups (Speed Boost)
   vec_logSl <- dt$logSl
-  
   for (var in interVars) {
     if(var %in% names(dt)) {
-      newCol <- paste0("inter_logSl_x_", var)
-      # set() is much faster in loops
-      set(dt, j = newCol, value = vec_logSl * dt[[var]])
-      interactionCols <- c(interactionCols, newCol)
+      set(dt, j = paste0("inter_logSl_x_", var), value = vec_logSl * dt[[var]])
     }
   }
   
   # ----------------------------------------------------------------------
-  # TENSOR SHAPING
+  # 5. CANDIDATE IDENTIFICATION & SCALING
   # ----------------------------------------------------------------------
   candidates <- c(
     "logSl", "cosTa", "sinTa",
@@ -101,39 +81,53 @@ prepareNNdata <- function(extractedVariables, pathX, pathID){
     "prop_needleleaf_start", "prop_mixedforest_start", "prop_veg_start", "prop_wets_start",
     "timeSinceFire_startLog", "timeSinceHarvest_startLog",
     "distpaved_startLog", "distunpaved_startLog", "distpolys_startLog",
-    interactionCols
+    grep("^inter_", names(dt), value = TRUE)
   )
-  dtfeatureCandidates <- intersect(candidates, names(dt))
+  featureCandidates <- intersect(candidates, names(dt))
   
-  # Safe Scaling (Handle NaNs if a column is constant)
-  dt[, (dtfeatureCandidates) := lapply(.SD, function(x) {
+  # Safe Scaling (Mean 0, SD 1)
+  dt[, (featureCandidates) := lapply(.SD, function(x) {
     val <- as.numeric(scale(x))
     val[is.na(val)] <- 0 
     return(val)
-  }), .SDcols = dtfeatureCandidates]
+  }), .SDcols = featureCandidates]
   
+  # ID Mapping
   dt[, idIndex := as.numeric(as.factor(id))]
   dtglobalNAnimals <- max(dt$idIndex)
   
-  # Create Tensor
-  mat <- as.matrix(dt[, ..dtfeatureCandidates])
-  arr <- array(mat, dim = c(steps, uniqueN(dt$indiv_step_id), length(dtfeatureCandidates)))
+  # ----------------------------------------------------------------------
+  # 6. TENSOR SHAPING & SAVING
+  # ----------------------------------------------------------------------
+  message("Shaping and saving tensors to disk...")
   
-  globalTensorX <- torch::torch_tensor(aperm(arr, c(2, 1, 3)), dtype = torch::torch_float())
+  # Convert to matrix of predictors
+  mat <- as.matrix(dt[, ..featureCandidates])
   
-  # IDs
-  valid_ids <- dt[case_ == TRUE, idIndex]
-  globalTensorID <- torch::torch_tensor(valid_ids, dtype = torch::torch_long())
+  # Reshape: (Bursts, Steps, Features)
+  # nrow / steps = total number of unique bursts
+  arr <- array(mat, dim = c(steps, nrow(dt)/steps, length(featureCandidates)))
   
-  message("Saving processed tensors to disk...")
-  
-  # SAVING
+  # Save Environment Tensor (X)
+  globalTensorX <- torch_tensor(aperm(arr, c(2, 1, 3)), dtype = torch_float())
   torch_save(globalTensorX, pathX)
+  
+  # Save ID Tensor (ID)
+  # Take the ID of the first step of every burst (the observed case)
+  valid_ids <- dt[case_ == TRUE, idIndex]
+  globalTensorID <- torch_tensor(valid_ids, dtype = torch_long())
   torch_save(globalTensorID, pathID)
   
-  return(list(modelPrep = list(globalTensorX = pathX,
-                               globalTensorID = pathID,
-                               globalNAnimals = dtglobalNAnimals,
-                               featureCandidates = dtfeatureCandidates),
-              preparedDataFinal = dt))
+  # ----------------------------------------------------------------------
+  # 7. RETURN
+  # ----------------------------------------------------------------------
+  return(list(
+    modelPrep = list(
+      globalTensorX = pathX,
+      globalTensorID = pathID,
+      globalNAnimals = dtglobalNAnimals,
+      featureCandidates = featureCandidates
+    ),
+    preparedDataFinal = dt # The full table with all original and new columns
+  ))
 }
