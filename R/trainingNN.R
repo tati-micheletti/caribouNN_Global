@@ -1,138 +1,31 @@
-trainingNN <- function(preparedData, batchSize, learningRate, epochs, 
-                       validationSplit = 0.2, outputDir, globalModelPath){
-  
-  message("Global Model: Loading Tensors from disk...")
-  
-  globalTensorX <- torch_load(preparedData$globalTensorX)
-  globalTensorID <- torch_load(preparedData$globalTensorID)
-  globalNAnimals <- preparedData$globalNAnimals
-  featureCandidates <- preparedData$featureCandidates
-  
-  message("Global Model: Training with Early Stopping and Best Model Saving...")
-  
-  # 1. Dataset
-  ds <- dataset("ds", 
-                initialize = function(x, id) {self$x <- x; self$id <- id},
-                .getitem = function(i) { 
-                  list(
-                    list(x=self$x[i,,], id=self$id[i]), 
-                    torch_tensor(1, dtype=torch_long()) 
-                  ) 
-                },
-                .length = function() { self$x$size(1) }
-  )
-  
-  # 2. Split Data
-  n_samples <- globalTensorX$size(1) 
-  all_indices <- 1:n_samples
-  
-  val_indices <- sample(all_indices, size = floor(n_samples * validationSplit))
-  train_indices <- setdiff(all_indices, val_indices)
-  
-  train_x <- globalTensorX[train_indices, , ]
-  train_id <- globalTensorID[train_indices]
-  val_x <- globalTensorX[val_indices, , ]
-  val_id <- globalTensorID[val_indices]
-  
-  train_dl <- dataloader(ds(train_x, train_id), batch_size = batchSize, shuffle = TRUE)
-  val_dl   <- dataloader(ds(val_x, val_id),   batch_size = batchSize, shuffle = FALSE)
-  
-  # 3. Model
-  Net <- nn_module(
-    "Net",
-    initialize = function(nIn, nAnimals) {
-      self$idEmb <- nn_embedding(nAnimals + 1, 8)
-      self$fc1 <- nn_linear(nIn + 8, 128)
-      self$fc2 <- nn_linear(128, 64)
-      self$out <- nn_linear(64, 1)
-      self$act <- nn_selu()
-    },
-    forward = function(input) {
-      x <- input$x; id <- input$id
-      emb <- self$idEmb(id)$unsqueeze(2)$expand(c(-1,x$shape[2],-1))
-      torch_cat(list(x,emb),3) %>% 
-        self$fc1() %>% self$act() %>% 
-        self$fc2() %>% self$act() %>% 
-        self$out() %>% torch_squeeze(3)
-    }
-  )
-  
-  # 4. Loss Wrapper
-  loss_wrapper <- function(input, target) {
-    nnf_cross_entropy(input, target$squeeze())
-  }
-  
-  # 5. Define Paths
-  # checkpointPath: Saves only the weights (smaller file, used for reloading)
-  checkpointPath <- file.path(outputDir, "global_best_weights.pt")
-  # globalModelPath: Saves the whole Luz object (safe for future sessions)
-  
-  # 6. Fit
-  fitted <- Net %>%
-    setup(
-      loss = loss_wrapper, 
-      optimizer = optim_adam
-    ) %>%
-    set_hparams(
-      nIn = length(featureCandidates), 
-      nAnimals = globalNAnimals
-    ) %>%
-    set_opt_hparams(
-      lr = learningRate
-    ) %>%
-    fit(
-      train_dl, 
-      epochs = epochs, 
-      valid_data = val_dl,
-      callbacks = list(
-        # SAVE HERE: This saves the weights every time metrics improve
-        luz_callback_model_checkpoint(path = checkpointPath, save_best_only = TRUE),
-        luz_callback_early_stopping(patience = 5),
-        luz_callback_lr_scheduler(
-          lr_reduce_on_plateau, 
-          factor = 0.5,
-          patience = 2,
-          verbose = TRUE
-        )
-      ),
-      verbose = TRUE
-    )
-  
-  message("\nGlobal Model Fitting Complete.")
-  
-  # 7. RELOAD BEST WEIGHTS (Robust)
-  if (file.exists(checkpointPath)) {
-    message("Reloading weights from best epoch: ", checkpointPath)
-    
-    tryCatch({
-      checkpoint <- torch_load(checkpointPath)
-      weights_to_load <- NULL
-      
-      # Determine format of the saved file
-      if (is.list(checkpoint) && "model" %in% names(checkpoint)) {
-        weights_to_load <- checkpoint$model
-      } else if (is.list(checkpoint) && "model_state_dict" %in% names(checkpoint)) {
-        weights_to_load <- checkpoint$model_state_dict
-      } else {
-        weights_to_load <- checkpoint
-      }
-      
-      fitted$model$load_state_dict(weights_to_load)
-      message(" -> Success! Best model weights loaded into memory.")
-      
-    }, error = function(e) {
-      message("!!! WARNING: Could not reload best weights. Using Last Epoch. !!!")
-      message("Error: ", e$message)
-    })
-    
-  } else {
-    warning("Best model checkpoint not found. Using last epoch weights.")
-  }
-  
-  # 8. SAVE FINAL OBJECT (The "External Pointer" Fix)
-  # Now that the object has the best weights loaded, save the whole thing safely.
-  message("Saving final full model object to: ", globalModelPath)
-  luz_save(fitted, globalModelPath)
-  
-  return(globalModelPath)
+#' Train the global ranking network (all years >= startYear) on a SEEDED random 80/20 split of
+#' strata. It is used only to rank covariates; its quality is irrelevant to the experiment.
+#' The held-out 20% is saved and used for the importance calculation.
+#' @return path to the best-epoch weights (a config file with nIn / nAnimals is written next to it)
+trainingNN <- function(preparedData, batchSize, learningRate, epochs, validationSplit = 0.2,
+                       outputDir, globalModelPath, seed = 20261007L, device = "cpu",
+                       earlyStopPatience = 5L, registryPath = NULL) {
+  message("Global Model: loading tensors from disk...")
+  x <- torch_load(preparedData$globalTensorX)
+  id <- torch_load(preparedData$globalTensorID)
+  nAnimals <- preparedData$globalNAnimals
+  n <- x$size(1)
+  registerSeeds(registryPath, "caribouNN_Global::trainingNN", "split+init", seed,
+                "global ranking model: 80/20 stratum split (R) and torch init/batch order")
+  valIdx <- sort(withSeed(seed, sample.int(n, floor(n * validationSplit))))
+  trIdx <- setdiff(seq_len(n), valIdx)
+  vi <- torch_tensor(valIdx, dtype = torch_long()); ti <- torch_tensor(trIdx, dtype = torch_long())
+  fit <- fitStratumNet(x$index_select(1, ti)$to(device = device), id$index_select(1, ti)$to(device = device),
+                       x$index_select(1, vi)$to(device = device), id$index_select(1, vi)$to(device = device),
+                       nAnimals = nAnimals, lr = learningRate, epochs = epochs, batchSize = batchSize,
+                       seed = seed, device = device, earlyStopPatience = earlyStopPatience)
+  checkWeightsRoundTrip(fit$bestState, globalModelPath, nIn = x$size(3), nAnimals = nAnimals,
+                        xVal = x$index_select(1, vi)$to(device = device), idVal = id$index_select(1, vi)$to(device = device),
+                        trainIdsSeen = fit$trainIdsSeen, expectedValLoss = fit$bestValLoss, device = device)
+  saveRDS(list(nIn = x$size(3), nAnimals = nAnimals, valIdx = valIdx, seed = seed, history = fit$history,
+               bestEpoch = fit$bestEpoch, bestValLoss = fit$bestValLoss, trainIdsSeen = fit$trainIdsSeen),
+          file.path(outputDir, "global_model_info.rds"))
+  message(sprintf("Global model done: best epoch %d, validation loss %.4f (random guessing: %.4f)",
+                  fit$bestEpoch, fit$bestValLoss, log(x$size(2))))
+  globalModelPath
 }

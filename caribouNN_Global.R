@@ -9,7 +9,7 @@ defineModule(sim, list(
   timeunit = "year",
   citation = list("citation.bib"),
   documentation = list("NEWS.md", "README.md", "caribouNN_Global.Rmd"),
-  reqdPkgs = list("SpaDES.core (>= 3.0.4)", "ggplot2", "data.table", "torch", "luz", "gridExtra"),
+  reqdPkgs = list("SpaDES.core (>= 3.0.4)", "data.table", "torch"),
   parameters = bindrows(
     #defineParameter("paramName", "paramClass", value, min, max, "parameter description"),
     defineParameter(".plots", "character", "screen", NA, NA,
@@ -45,8 +45,24 @@ defineModule(sim, list(
                     "Should the feature ranking be re-run?"),
     defineParameter("rerunRSS", "logical", FALSE, NA, NA, 
                     "Should the RSS be re-run?"),
-    defineParameter("scheduleGlobalRSS", "logical", TRUE, NA, NA, 
-                    "Should the RSS be scheduled to run?")
+    defineParameter("scheduleGlobalRSS", "logical", FALSE, NA, NA, 
+                    "Should the RSS be scheduled to run? Off: the RSS code still uses the old luz model."),
+    defineParameter("startYear", "numeric", 2013, NA, NA,
+                    "First year used. Earlier years are discarded before any processing."),
+    defineParameter("backgroundYr", "numeric", 1900, NA, NA,
+                    paste0("Year used by prepLandscape to fill cells without a recorded fire/harvest. ",
+                           "Values equal to year - backgroundYr are the 'no record' sentinel.")),
+    defineParameter("capYears", "numeric", 40, NA, NA,
+                    "Time since fire/harvest for 'no record' (and cap for real values), as in the published iSSA."),
+    defineParameter("zClip", "numeric", 10, NA, NA,
+                    "Standardised covariates are clipped to +/- zClip."),
+    defineParameter("globalSeed", "numeric", 20261007, NA, NA,
+                    "Seed of the global ranking model (split, initialisation, batch order)."),
+    defineParameter("importanceSeed", "numeric", 20261008, NA, NA,
+                    "Seed of the permutation importance."),
+    defineParameter("nRepImportance", "numeric", 5, 1, 50,
+                    "Number of permutation repeats per covariate."),
+    defineParameter("useGPU", "logical", FALSE, NA, NA, "Use a GPU if available.")
     
   ),
   inputObjects = bindrows(
@@ -97,14 +113,19 @@ doEvent.caribouNN_Global = function(sim, eventTime, eventType) {
       } else {
         sim$preparedData <- prepareNNdata(extractedVariables = sim$extractedVariables,
                                           pathX = pathX,
-                                          pathID = pathID)
+                                          pathID = pathID,
+                                          startYear = P(sim)$startYear,
+                                          backgroundYr = P(sim)$backgroundYr,
+                                          capYears = P(sim)$capYears,
+                                          zClip = P(sim)$zClip)
+        fwrite(sim$preparedData$recodeReport, file.path(outputPath(sim), "disturbanceRecodeReport.csv"))
         saveRDS(sim$preparedData$modelPrep$globalNAnimals, file = globalNAnimalsPath)
         saveRDS(sim$preparedData$modelPrep$featureCandidates, file = featureCandidatesPath)
         fwrite(sim$preparedData$preparedDataFinal, file = prepDataPath)
       }
     },
     trainTheModel = {
-      globalModelPath <- file.path(outputPath(sim), "global_best_model.pt")
+      globalModelPath <- file.path(outputPath(sim), "global_best_weights.pt")
       if (all(file.exists(globalModelPath),
               !P(sim)$rerunTraining)){
         message("All inputs for trainTheModel found. Loading...")
@@ -112,10 +133,13 @@ doEvent.caribouNN_Global = function(sim, eventTime, eventType) {
       } else {
         sim$globalModel <- trainingNN(preparedData = sim$preparedData$modelPrep, 
                                       batchSize = P(sim)$batchSize,
-                                      epoch = P(sim)$epoch,
+                                      epochs = P(sim)$epoch,
                                       learningRate =  P(sim)$learningRate,
                                       outputDir = outputPath(sim),
-                                      globalModelPath = globalModelPath)
+                                      globalModelPath = globalModelPath,
+                                      seed = P(sim)$globalSeed,
+                                      device = if (isTRUE(P(sim)$useGPU) && torch::cuda_is_available()) "cuda" else "cpu",
+                                      registryPath = file.path(outputPath(sim), "seedRegistry.csv"))
       }
     },
     rankFeatures = {
@@ -127,7 +151,10 @@ doEvent.caribouNN_Global = function(sim, eventTime, eventType) {
       } else {
         sim$featurePriority <- featureImportance(globalModelPath = sim$globalModel, 
                                                  preparedData = sim$preparedData, 
-                                                 batchSize = P(sim)$batchSize)
+                                                 batchSize = P(sim)$batchSize,
+                                                 nRep = P(sim)$nRepImportance,
+                                                 seed = P(sim)$importanceSeed,
+                                                 registryPath = file.path(outputPath(sim), "seedRegistry.csv"))
         fwrite(as.data.table(sim$featurePriority), file = prepRankPath)
       }
     },

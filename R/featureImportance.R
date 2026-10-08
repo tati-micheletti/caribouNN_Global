@@ -1,83 +1,56 @@
-featureImportance <- function(globalModelPath, preparedData, batchSize){
-  
-  message("Global Model: Calculating Feature Importance...")
-  
-  # Unpack
-  # 1. LOAD TENSORS
-  x <- torch_load(preparedData$modelPrep$globalTensorX)
-  id <- torch_load(preparedData$modelPrep$globalTensorID)
-  candidates <- preparedData$modelPrep$featureCandidates
+#' Permutation importance of each candidate covariate on the HELD-OUT strata of the global model.
+#'
+#' The model scores the 11 candidate steps of a stratum against each other, so a covariate can
+#' only help through differences BETWEEN candidates of the same stratum. The ranking therefore
+#' uses WITHIN-STRATUM permutation: the covariate's 11 values are shuffled among the 11
+#' candidates of each stratum (averaged over `nRep` repeats). The previous method (moving whole
+#' blocks of 11 values between strata) is also returned (`impBlocksAcrossStrata`) for reference.
+#' Features are ordered by the within-stratum importance.
+featureImportance <- function(globalModelPath, preparedData, batchSize, nRep = 5L,
+                              seed = 20261008L, registryPath = NULL, chunk = 20000L) {
+  message("Global Model: calculating within-stratum permutation importance...")
+  registerSeeds(registryPath, "caribouNN_Global::featureImportance", "permutations", seed,
+                "torch seed for within-stratum and block permutations")
+  torch::torch_manual_seed(seed)
+  prep <- preparedData$modelPrep
+  x <- torch_load(prep$globalTensorX); id <- torch_load(prep$globalTensorID)
+  info <- readRDS(file.path(dirname(globalModelPath), "global_model_info.rds"))
+  cand <- prep$featureCandidates
+  net <- makeStratumNet()(nIn = info$nIn, nAnimals = info$nAnimals)
+  net$load_state_dict(torch_load(globalModelPath))
+  net$eval()
+  vi <- torch_tensor(info$valIdx, dtype = torch_long())
+  xv <- x$index_select(1, vi); idv <- id$index_select(1, vi)
+  n <- xv$size(1); S <- xv$size(2)
+  seen <- info$trainIdsSeen
 
-  # Extract the raw torch model from the Luz object
-  globalModel <- luz_load(globalModelPath)
-  model <- globalModel$model 
-  model$eval()
-  
-  # 1. DEFINE DATASET LOCALLY
-  # We need this definition to create loaders for both Baseline and Permutations
-  ds <- dataset("ds", 
-                initialize = function(x, id) {self$x<-x; self$id<-id},
-                .getitem = function(i) { 
-                  list(list(x=self$x[i,,], id=self$id[i]), torch_tensor(1, dtype=torch_long())) 
-                },
-                .length = function() { self$x$size(1) }
-  )
-  
-  # 2. CALCULATE BASELINE
-  # Create a fresh loader for the original data
-  dl <- dataloader(ds(x, id), batch_size = batchSize, shuffle = FALSE)
-  
-  base_loss <- 0
-  count <- 0
-  
-  with_no_grad({
-    coro::loop(for (b in dl) {
-      scores <- model(b[[1]]) # Model output is [Batch, Steps]
-      # Squeeze target only
-      base_loss <- base_loss + nnf_cross_entropy(scores, b[[2]]$squeeze())$item()
-      count <- count + 1
-    })
-  })
-  base_loss <- base_loss / count
-  message("Baseline Loss: ", round(base_loss, 4))
-  
-  # 3. PERMUTATION LOOP
-  imp_df <- data.frame(Feature = candidates, Importance = 0)
-  original_x <- x$clone()
-  
-  # Get number of bursts once (Integer)
-  n_bursts <- original_x$size(1)
-  
-  for(i in seq_along(candidates)) {
-    # Shuffle column i
-    perm_x <- original_x$clone()
-    # idx <- torch::torch_randperm(perm_x$size(1)) + 1L
-    idx <- sample.int(n_bursts)
-    perm_x[,,i] <- perm_x[idx,,i]
-    
-    # Create loader for shuffled data using the 'ds' defined above
-    perm_dl <- dataloader(ds(perm_x, id), batch_size = batchSize, shuffle = FALSE)
-    
-    new_loss <- 0
-    count <- 0
-    
-    with_no_grad({
-      coro::loop(for (b in perm_dl) {
-        scores <- model(b[[1]])
-        new_loss <- new_loss + nnf_cross_entropy(scores, b[[2]]$squeeze())$item()
-        count <- count + 1
-      })
-    })
-    
-    imp_val <- (new_loss / count) - base_loss
-    imp_df$Importance[i] <- imp_val
+  lossOf <- function(xx) mean(scoreStrata(net, xx, idv, seen, info$nAnimals, chunk = chunk)$loss)
+  base <- lossOf(xv)
+  message("Baseline held-out loss: ", round(base, 4), " (random guessing ", round(log(S), 4), ")")
+
+  withinShuffle <- function(col) {              # col: [n, S]
+    ord <- torch::torch_argsort(torch::torch_rand(n, S), dim = 2)
+    col$gather(2, ord)
+  }
+  res <- vector("list", length(cand))
+  for (k in seq_along(cand)) {
+    impW <- numeric(nRep); impB <- numeric(nRep)
+    for (r in seq_len(nRep)) {
+      xw <- xv$clone(); xw[, , k] <- withinShuffle(xv[, , k]); impW[r] <- lossOf(xw) - base
+      xb <- xv$clone(); xb[, , k] <- xv[, , k]$index_select(1, torch::torch_randperm(n) + 1L); impB[r] <- lossOf(xb) - base
+    }
+    res[[k]] <- data.frame(Feature = cand[k], Importance = mean(impW), ImportanceSD = stats::sd(impW),
+                           impBlocksAcrossStrata = mean(impB))
     cat(".")
   }
-  
-  # 4. Return Sorted List
-  imp_df <- imp_df[order(-imp_df$Importance),]
-  print(head(imp_df, 10))
-  
-  message("\nGlobal Feature Ranking Complete.")
-  return(imp_df)
+  imp <- do.call(rbind, res)
+  imp$baselineLoss <- base
+  imp <- imp[order(-imp$Importance), ]
+  rownames(imp) <- NULL
+  imp$rankWithin <- seq_len(nrow(imp))
+  imp$rankBlocks <- rank(-imp$impBlocksAcrossStrata)
+  print(utils::head(imp, 12))
+  message("\nGlobal feature ranking complete (Spearman within vs blocks: ",
+          round(stats::cor(imp$rankWithin, imp$rankBlocks, method = "spearman"), 3), ").")
+  imp
 }
